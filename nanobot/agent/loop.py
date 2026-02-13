@@ -18,6 +18,7 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.send_whatsapp import SendWhatsAppTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 
@@ -94,6 +95,9 @@ class AgentLoop:
         # Web tools
         self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
+        
+        # WhatsApp outreach tool
+        self.tools.register(SendWhatsAppTool())
         
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)

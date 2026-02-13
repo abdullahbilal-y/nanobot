@@ -22,3 +22,4 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `summarize` | Summarize URLs, files, and YouTube videos |
 | `tmux` | Remote-control tmux sessions |
 | `skill-creator` | Create new skills |
+| `lead-finder` | Find website prospects on the web and contact via WhatsApp |
