@@ -1,0 +1,74 @@
+[33mcommit 4f928e9d2a27879b95b1f16286a7aeeab27feed1[m[33m ([m[1;36mHEAD -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: Re-bin <xubinrencs@gmail.com>
+Date:   Mon Feb 9 16:17:35 2026 +0000
+
+    feat: improve QQ channel setup guide and fix botpy intent flags
+
+[1mdiff --git a/README.md b/README.md[m
+[1mindex 7e1f80b..eb2ff7f 100644[m
+[1m--- a/README.md[m
+[1m+++ b/README.md[m
+[36m@@ -341,16 +341,24 @@[m [mnanobot gateway[m
+ </details>[m
+ [m
+ <details>[m
+[31m-<summary><b>QQ (QQ私聊)</b></summary>[m
+[32m+[m[32m<summary><b>QQ (QQ单聊)</b></summary>[m
+ [m
+[31m-Uses **botpy SDK** with WebSocket — no public IP required.[m
+[32m+[m[32mUses **botpy SDK** with WebSocket — no public IP required. Currently supports **private messages only**.[m
+ [m
+[31m-**1. Create a QQ bot**[m
+[31m-- Visit [QQ Open Platform](https://q.qq.com)[m
+[32m+[m[32m**1. Register & create bot**[m
+[32m+[m[32m- Visit [QQ Open Platform](https://q.qq.com) → Register as a developer (personal or enterprise)[m
+ - Create a new bot application[m
+[31m-- Get **AppID** and **Secret** from "Developer Settings"[m
+[32m+[m[32m- Go to **开发设置 (Developer Settings)** → copy **AppID** and **AppSecret**[m
+ [m
+[31m-**2. Configure**[m
+[32m+[m[32m**2. Set up sandbox for testing**[m
+[32m+[m[32m- In the bot management console, find **沙箱配置 (Sandbox Config)**[m
+[32m+[m[32m- Under **在消息列表配置**, click **添加成员** and add your own QQ number[m
+[32m+[m[32m- Once added, scan the bot's QR code with mobile QQ → open the bot profile → tap "发消息" to start chatting[m
+[32m+[m
+[32m+[m[32m**3. Configure**[m
+[32m+[m
+[32m+[m[32m> - `allowFrom`: Leave empty for public access, or add user openids to restrict. You can find openids in the nanobot logs when a user messages the bot.[m
+[32m+[m[32m> - For production: submit a review in the bot console and publish. See [QQ Bot Docs](https://bot.q.qq.com/wiki/) for the full publishing flow.[m
+ [m
+ ```json[m
+ {[m
+[36m@@ -365,17 +373,13 @@[m [mUses **botpy SDK** with WebSocket — no public IP required.[m
+ }[m
+ ```[m
+ [m
+[31m-> `allowFrom`: Leave empty for public access, or add user openids to restrict access.[m
+[31m-> Example: `"allowFrom": ["user_openid_1", "user_openid_2"]`[m
+[31m-[m
+[31m-**3. Run**[m
+[32m+[m[32m**4. Run**[m
+ [m
+ ```bash[m
+ nanobot gateway[m
+ ```[m
+ [m
+[31m-> [!TIP][m
+[31m-> QQ bot currently supports **private messages only**. Group chat support coming soon![m
+[32m+[m[32mNow send a message to the bot from QQ — it should respond![m
+ [m
+ </details>[m
+ [m
+[1mdiff --git a/nanobot/channels/qq.py b/nanobot/channels/qq.py[m
+[1mindex e3efb4f..5964d30 100644[m
+[1m--- a/nanobot/channels/qq.py[m
+[1m+++ b/nanobot/channels/qq.py[m
+[36m@@ -27,7 +27,7 @@[m [mif TYPE_CHECKING:[m
+ [m
+ def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":[m
+     """Create a botpy Client subclass bound to the given channel."""[m
+[31m-    intents = botpy.Intents(c2c_message=True)[m
+[32m+[m[32m    intents = botpy.Intents(public_messages=True, direct_message=True)[m
+ [m
+     class _Bot(botpy.Client):[m
+         def __init__(self):[m
