@@ -23,3 +23,4 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `tmux` | Remote-control tmux sessions |
 | `skill-creator` | Create new skills |
 | `lead-finder` | Find website prospects on the web and contact via WhatsApp |
+| `email-checker` | Check for new emails and forward summaries to WhatsApp |
