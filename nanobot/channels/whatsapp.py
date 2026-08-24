@@ -22,9 +22,10 @@ class WhatsAppChannel(BaseChannel):
     
     name = "whatsapp"
     
-    def __init__(self, config: WhatsAppConfig, bus: MessageBus):
+    def __init__(self, config: WhatsAppConfig, bus: MessageBus, groq_api_key: str = ""):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
+        self.groq_api_key = groq_api_key
         self._ws = None
         self._connected = False
     
@@ -88,6 +89,20 @@ class WhatsAppChannel(BaseChannel):
         except Exception as e:
             logger.error(f"Error sending WhatsApp message: {e}")
     
+    async def _transcribe(self, media_path: str) -> str:
+        """Transcribe a downloaded voice note. Returns "" on any failure."""
+        try:
+            from nanobot.providers.transcription import GroqTranscriptionProvider
+
+            transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+            text = await transcriber.transcribe(media_path)
+            if text:
+                logger.info(f"Transcribed voice note: {text[:60]}...")
+            return text
+        except Exception as e:
+            logger.error(f"Voice transcription failed for {media_path}: {e}")
+            return ""
+
     async def _handle_bridge_message(self, raw: str) -> None:
         """Handle a message from the bridge."""
         try:
@@ -111,11 +126,17 @@ class WhatsAppChannel(BaseChannel):
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
             logger.info(f"Sender {sender}")
             
-            # Handle voice transcription if it's a voice message
-            if content == "[Voice Message]":
-                logger.info(f"Voice message received from {sender_id}, but direct download from bridge is not yet supported.")
-                content = "[Voice Message: Transcription not available for WhatsApp yet]"
-            
+            # The bridge downloads and decrypts voice notes for us and passes a
+            # local path. Transcription is best-effort: a Groq failure degrades
+            # the content but must never drop the message.
+            media_path = data.get("mediaPath")
+            if media_path:
+                transcription = await self._transcribe(media_path)
+                if transcription:
+                    content = f"[transcription: {transcription}]"
+                else:
+                    content = f"[voice: {media_path}]"
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=sender,  # Use full LID for replies
@@ -123,7 +144,12 @@ class WhatsAppChannel(BaseChannel):
                 metadata={
                     "message_id": data.get("id"),
                     "timestamp": data.get("timestamp"),
-                    "is_group": data.get("isGroup", False)
+                    "is_group": data.get("isGroup", False),
+                    "media_path": media_path,
+                    "media_type": data.get("mediaType"),
+                    "duration_sec": data.get("durationSec"),
+                    "historical": data.get("historical", False),
+                    "from_me": data.get("fromMe", False),
                 }
             )
         

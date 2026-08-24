@@ -11,8 +11,20 @@ interface SendCommand {
   text: string;
 }
 
+interface BackfillCommand {
+  type: 'backfill';
+  jid: string;
+  count?: number;
+}
+
+interface HealthCommand {
+  type: 'health';
+}
+
+type BridgeCommand = SendCommand | BackfillCommand | HealthCommand;
+
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error';
+  type: 'message' | 'status' | 'qr' | 'error' | 'health';
   [key: string]: unknown;
 }
 
@@ -43,9 +55,9 @@ export class BridgeServer {
 
       ws.on('message', async (data) => {
         try {
-          const cmd = JSON.parse(data.toString()) as SendCommand;
-          await this.handleCommand(cmd);
-          ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
+          const cmd = JSON.parse(data.toString()) as BridgeCommand;
+          const reply = await this.handleCommand(cmd);
+          ws.send(JSON.stringify(reply));
         } catch (error) {
           console.error('Error handling command:', error);
           ws.send(JSON.stringify({ type: 'error', error: String(error) }));
@@ -67,9 +79,28 @@ export class BridgeServer {
     await this.wa.connect();
   }
 
-  private async handleCommand(cmd: SendCommand): Promise<void> {
-    if (cmd.type === 'send' && this.wa) {
-      await this.wa.sendMessage(cmd.to, cmd.text);
+  private async handleCommand(cmd: BridgeCommand): Promise<Record<string, unknown>> {
+    if (!this.wa) {
+      return { type: 'error', error: 'WhatsApp client not initialized' };
+    }
+
+    switch (cmd.type) {
+      case 'send':
+        await this.wa.sendMessage(cmd.to, cmd.text);
+        return { type: 'sent', to: cmd.to };
+
+      case 'backfill': {
+        // Fire-and-forget: history arrives later on 'messaging-history.set'
+        // and is broadcast as ordinary messages flagged historical.
+        const requestId = await this.wa.fetchHistory(cmd.jid, cmd.count ?? 50);
+        return { type: 'backfill_requested', jid: cmd.jid, requestId };
+      }
+
+      case 'health':
+        return { type: 'health', ...this.wa.getHealth() };
+
+      default:
+        return { type: 'error', error: `Unknown command: ${JSON.stringify(cmd)}` };
     }
   }
 
