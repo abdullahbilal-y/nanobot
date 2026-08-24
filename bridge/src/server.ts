@@ -31,15 +31,21 @@ interface DownloadCommand {
   ids: string[];
 }
 
+interface ResolveCommand {
+  type: 'resolve';
+  phone: string;
+}
+
 type BridgeCommand =
   | SendCommand
   | BackfillCommand
   | HealthCommand
   | ContactsCommand
-  | DownloadCommand;
+  | DownloadCommand
+  | ResolveCommand;
 
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error' | 'health' | 'contacts' | 'downloaded';
+  type: 'message' | 'status' | 'qr' | 'error' | 'health' | 'contacts' | 'downloaded' | 'resolved';
   [key: string]: unknown;
 }
 
@@ -116,6 +122,9 @@ export class BridgeServer {
 
       case 'contacts':
         return { type: 'contacts', contacts: this.wa.findContacts(cmd.query || '') };
+
+      case 'resolve':
+        return { type: 'resolved', ...(await this.wa.resolveNumber(cmd.phone)) };
 
       case 'download': {
         const results = await this.wa.downloadByIds(cmd.ids || []);

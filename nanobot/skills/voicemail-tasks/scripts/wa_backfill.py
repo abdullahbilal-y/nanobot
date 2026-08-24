@@ -282,6 +282,41 @@ async def contacts(query: str) -> int:
     return 0
 
 
+async def resolve(phone: str) -> int:
+    """Map a phone number to the LID its chat is actually addressed by."""
+    import websockets
+
+    try:
+        async with websockets.connect(BRIDGE_URL, max_size=None) as ws:
+            await ws.send(json.dumps({"type": "resolve", "phone": phone}))
+            got = {}
+
+            def on_msg(data: dict) -> None:
+                if data.get("type") == "resolved":
+                    got.update(data)
+
+            await _collect(ws, 30, on_msg)
+    except ConnectionRefusedError:
+        print(f"Error: cannot reach the bridge at {BRIDGE_URL}.")
+        return 1
+
+    if not got:
+        print("No reply from bridge.")
+        return 1
+    print(json.dumps(got, indent=2))
+    if got.get("lid"):
+        print("")
+        print(f"Use this as --sender: {got['lid']}")
+    elif got.get("exists"):
+        print("")
+        print("On WhatsApp, but no LID mapping is known yet.")
+        print("The mapping appears once a message is exchanged with them.")
+    else:
+        print("")
+        print("This number does not appear to be on WhatsApp.")
+    return 0
+
+
 async def health() -> int:
     """Ask the bridge whether media downloads are actually succeeding."""
     import websockets
@@ -373,12 +408,16 @@ def main() -> int:
                         help="show whose voice notes are present, then exit")
     parser.add_argument("--contacts", default=None, metavar="QUERY",
                         help="search the bridge address book, then exit")
+    parser.add_argument("--resolve", default=None, metavar="PHONE",
+                        help="map a phone number to its LID, then exit")
     parser.add_argument("--health", action="store_true")
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
 
     if args.test:
         return self_test()
+    if args.resolve is not None:
+        return asyncio.run(resolve(args.resolve))
     if args.health:
         return asyncio.run(health())
     if args.contacts is not None:

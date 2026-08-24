@@ -242,11 +242,66 @@ export class WhatsAppClient {
     }
   }
 
-  /** Best-known phone JID for an address, or '' when we cannot resolve one. */
-  private resolvePhone(jid: string): string {
+  /**
+   * Best-known phone JID for an address, or '' when we cannot resolve one.
+   *
+   * For a LID-addressed chat the phone number is not in the message at all.
+   * Baileys keeps the authoritative LID<->PN mapping in its signal repository,
+   * so ask that, and cache the answer in the address book so we ask once.
+   */
+  private async resolvePhone(jid: string): Promise<string> {
     if (!jid) return '';
     if (jid.endsWith('@s.whatsapp.net')) return jid;
-    return this.contacts.get(jid)?.phone || '';
+    if (!jid.endsWith('@lid')) return '';
+
+    const cached = this.contacts.get(jid)?.phone;
+    if (cached) return cached;
+
+    try {
+      const pn = await this.sock?.signalRepository?.lidMapping?.getPNForLID?.(jid);
+      if (pn) {
+        this.indexContacts([{ id: jid, lid: jid, phoneNumber: pn }]);
+        return pn;
+      }
+    } catch (error) {
+      // Mapping is a lookup, not a guarantee; never let it break ingestion.
+      console.error(`LID->PN lookup failed for ${jid}: ${(error as Error).message}`);
+    }
+    return '';
+  }
+
+  /**
+   * Resolve a phone number to the LID its chat is actually addressed by.
+   * This is what makes "watch this person's voice notes" possible at all.
+   */
+  async resolveNumber(phone: string): Promise<Record<string, unknown>> {
+    if (!this.sock) throw new Error('Not connected');
+
+    const digits = phone.replace(/\D/g, '');
+    const pnJid = `${digits}@s.whatsapp.net`;
+    const out: Record<string, unknown> = { input: phone, pn: pnJid };
+
+    try {
+      const results = await this.sock.onWhatsApp(digits);
+      const hit = results?.[0];
+      out.exists = !!hit?.exists;
+      if (hit?.jid) out.jid = hit.jid;
+      if (hit?.lid) out.lid = hit.lid;
+    } catch (error) {
+      out.existsError = (error as Error).message;
+    }
+
+    try {
+      const lid = await this.sock.signalRepository?.lidMapping?.getLIDForPN?.(pnJid);
+      if (lid) out.lid = lid;
+    } catch (error) {
+      out.lidError = (error as Error).message;
+    }
+
+    if (out.lid) {
+      this.indexContacts([{ id: pnJid, lid: out.lid as string, phoneNumber: pnJid }]);
+    }
+    return out;
   }
 
   /** Search the address book by name or by digits of the number. */
@@ -298,8 +353,12 @@ export class WhatsAppClient {
       this.indexContacts([{ id: jid, notify: msg.pushName }]);
     }
 
-    // remoteJidAlt is usually absent, so fall back to the address book.
-    const pn = msg.key.remoteJidAlt || this.resolvePhone(jid);
+    // remoteJidAlt is usually absent. Resolving costs a lookup, so only do it
+    // for the messages this pipeline actually cares about.
+    let pn: string = msg.key.remoteJidAlt || '';
+    if (!pn && audio) {
+      pn = await this.resolvePhone(jid);
+    }
     const known = this.contacts.get(jid);
 
     this.options.onMessage({
