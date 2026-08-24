@@ -134,10 +134,11 @@ export class WhatsAppClient {
       logger,
       printQRInTerminal: false,
       browser: ['nanobot', 'cli', VERSION],
-      // Recent history only. A full sync is far more than this use case needs
-      // and is what pushes a small host into swapping/OOM; targeted windows
-      // come from fetchMessageHistory() instead.
-      syncFullHistory: false,
+      // Recent history only by default: a full sync is far more than this use
+      // case needs, and is what pushes a small host into OOM. Set
+      // SYNC_FULL_HISTORY=1 for a one-off deep sync — safe now that media is
+      // fetched on demand rather than inline.
+      syncFullHistory: process.env.SYNC_FULL_HISTORY === '1',
       markOnlineOnConnect: false,
     });
 
