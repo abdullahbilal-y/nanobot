@@ -1,0 +1,29 @@
+[Unit]
+Description=nanobot WhatsApp bridge (Baileys)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/nanobot/bridge
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=10
+
+# Keep history sync off. A full sync on a small host is what pushed this box
+# into unresponsiveness; targeted backfill does not need it.
+Environment=SYNC_FULL_HISTORY=0
+Environment=MAX_PENDING_MEDIA=2000
+
+# Hard ceiling so a runaway sync kills only this unit rather than starving the
+# machine until sshd can no longer fork. This is the safeguard that turns a
+# lockup into a clean restart.
+MemoryMax=400M
+MemoryHigh=320M
+
+StandardOutput=append:/var/log/nanobot-wa-bridge.log
+StandardError=append:/var/log/nanobot-wa-bridge.log
+
+[Install]
+WantedBy=multi-user.target

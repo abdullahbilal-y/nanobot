@@ -103,7 +103,12 @@ export class WhatsAppClient {
    * consumer ask for the handful it actually wants.
    */
   private pendingMedia = new Map<string, PendingMedia>();
-  private static readonly MAX_PENDING = 20000;
+  /**
+   * Deliberately small. This runs on a ~1GB host with no swap, where an
+   * oversized cache is the difference between a slow sync and a box that stops
+   * answering SSH. Raise it only on a machine with headroom to spare.
+   */
+  private static readonly MAX_PENDING = Number(process.env.MAX_PENDING_MEDIA || 2000);
   private health: MediaHealth = {
     attempts: 0,
     successes: 0,

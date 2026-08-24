@@ -1,0 +1,22 @@
+[Unit]
+Description=nanobot voicemail watcher (voice notes -> task digests)
+After=nanobot-wa-bridge.service
+Wants=nanobot-wa-bridge.service
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/nanobot/nanobot/skills/voicemail-tasks/scripts
+# Sender, target and models come from ~/.nanobot/voicemail_tasks.json so they
+# can change without editing this unit.
+ExecStart=/home/botuser/nanobot/venv/bin/python -u wa_watch.py
+Restart=always
+RestartSec=15
+
+MemoryMax=250M
+
+StandardOutput=append:/var/log/nanobot-voicemail-watch.log
+StandardError=append:/var/log/nanobot-voicemail-watch.log
+
+[Install]
+WantedBy=multi-user.target
