@@ -46,14 +46,15 @@ def build_digest(db_path: Path, msg_id: str) -> str:
     return digest_for_message(db_path, msg_id)
 
 
-async def watch(sender: str, target: str, db_path: Path, dry_run: bool) -> int:
+async def watch(sender: str, target: str, db_path: Path, dry_run: bool,
+                name: str = "") -> int:
     import websockets
 
     want = "".join(c for c in sender if c.isdigit())
     target_jid = to_jid(target) if target else ""
 
     print(f"Bridge:  {BRIDGE_URL}")
-    print(f"Watching voice notes from: {sender}")
+    print(f"Watching voice notes from: {sender or '(any number)'} / name {name or '(any)'}")
     print(f"Digest goes to: {target_jid or '(dry run — nothing sent)'}")
     print("Ctrl-C to stop.\n")
 
@@ -71,7 +72,7 @@ async def watch(sender: str, target: str, db_path: Path, dry_run: bool) -> int:
                         continue
                     if not data.get("mediaPath"):
                         continue
-                    if not matches_sender(data, want):
+                    if not matches_sender(data, want, name):
                         continue
 
                     msg_id = data.get("id", "")
@@ -181,6 +182,7 @@ def self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Watch WhatsApp voice notes")
     parser.add_argument("--sender", default="", help="whose voice notes to watch")
+    parser.add_argument("--name", default="", help="match on contact/display name instead")
     parser.add_argument("--target", default=os.environ.get("VOICEMAIL_TARGET", ""),
                         help="number to send digests to")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -196,11 +198,12 @@ def main() -> int:
     data = _load(args.db)
     sender = args.sender or data["settings"].get("watch_sender", "")
     target = args.target or data["settings"].get("target_jid", "")
-    if not sender:
-        parser.error("--sender is required (or set watch_sender in settings)")
+    name = args.name or data["settings"].get("watch_name", "")
+    if not sender and not name:
+        parser.error("need --sender or --name (or set watch_sender/watch_name in settings)")
 
     try:
-        return asyncio.run(watch(sender, target, args.db, args.dry_run))
+        return asyncio.run(watch(sender, target, args.db, args.dry_run, name))
     except KeyboardInterrupt:
         print("\nStopped.")
         return 0

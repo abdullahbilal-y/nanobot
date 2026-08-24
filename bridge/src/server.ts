@@ -26,10 +26,20 @@ interface ContactsCommand {
   query?: string;
 }
 
-type BridgeCommand = SendCommand | BackfillCommand | HealthCommand | ContactsCommand;
+interface DownloadCommand {
+  type: 'download';
+  ids: string[];
+}
+
+type BridgeCommand =
+  | SendCommand
+  | BackfillCommand
+  | HealthCommand
+  | ContactsCommand
+  | DownloadCommand;
 
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error' | 'health' | 'contacts';
+  type: 'message' | 'status' | 'qr' | 'error' | 'health' | 'contacts' | 'downloaded';
   [key: string]: unknown;
 }
 
@@ -106,6 +116,11 @@ export class BridgeServer {
 
       case 'contacts':
         return { type: 'contacts', contacts: this.wa.findContacts(cmd.query || '') };
+
+      case 'download': {
+        const results = await this.wa.downloadByIds(cmd.ids || []);
+        return { type: 'downloaded', results };
+      }
 
       default:
         return { type: 'error', error: `Unknown command: ${JSON.stringify(cmd)}` };

@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Drive the WhatsApp bridge to backfill voice notes into the voicemail store.
 
-Asks the bridge to replay a chat's recent history, collects the voice notes the
-bridge downloads and decrypts, and ingests them. Ingestion is idempotent on the
-WhatsApp message id, so this is safe to run repeatedly and safe to run while the
-live listener is also running.
+Runs in two phases, because a history sync is far too large to fetch audio for
+indiscriminately:
+
+  1. Ask the bridge to replay a window of history and collect only metadata.
+  2. Pick the voice notes that match the sender and time window, and ask the
+     bridge to download just those.
+
+Ingestion is idempotent on the WhatsApp message id, so this is safe to run
+repeatedly and safe to run alongside the live watcher.
 
 Usage:
-    python wa_backfill.py --sender 923001234567 --days 2
-    python wa_backfill.py --sender 923001234567 --days 2 --collect 90
+    python wa_backfill.py --sender 447958778593 --days 2
+    python wa_backfill.py --name "Ahmed" --days 2
+    python wa_backfill.py --list-senders --days 7
+    python wa_backfill.py --contacts "ahmed"
     python wa_backfill.py --health
     python wa_backfill.py --test
 """
@@ -18,6 +25,7 @@ import asyncio
 import json
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,20 +43,35 @@ def to_jid(sender: str) -> str:
     return f"{digits}@s.whatsapp.net"
 
 
-def matches_sender(msg: dict, want_digits: str) -> bool:
-    """Match a bridge message against a wanted number.
+def digits_of(value: str) -> str:
+    return "".join(c for c in str(value).split("@")[0] if c.isdigit())
 
-    WhatsApp now addresses some chats by an opaque LID rather than the phone
-    number, and the bridge reports both, so check either. Compare on the last 9
-    digits so country-code and local-prefix spellings of the same number match.
+
+def matches_sender(msg: dict, want_digits: str = "", want_name: str = "") -> bool:
+    """Match a bridge message against a wanted number and/or display name.
+
+    WhatsApp addresses most chats by an opaque LID that has no relation to the
+    phone number, and the number is often absent from the message entirely. So
+    match on the number when it is there, and fall back to the display name the
+    bridge resolved, which is frequently the only usable identifier.
     """
-    if not want_digits:
+    if not want_digits and not want_name:
         return True
-    tail = want_digits[-9:]
-    for field in ("sender", "pn"):
-        value = "".join(c for c in str(msg.get(field, "")).split("@")[0] if c.isdigit())
-        if value and value.endswith(tail):
-            return True
+
+    if want_digits:
+        tail = want_digits[-9:]
+        for field in ("sender", "pn"):
+            value = digits_of(msg.get(field, ""))
+            if value and value.endswith(tail):
+                return True
+
+    if want_name:
+        needle = want_name.lower()
+        for field in ("contactName", "pushName"):
+            value = str(msg.get(field) or "").lower()
+            if needle in value:
+                return True
+
     return False
 
 
@@ -59,72 +82,127 @@ def within_window(ts: int, days: float) -> bool:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc) >= cutoff
 
 
-async def backfill(sender: str, days: float, collect_secs: float,
+def fmt_ts(ts: int) -> str:
+    if not ts:
+        return "?"
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+async def _collect(ws, seconds: float, on_message) -> None:
+    """Drain bridge traffic for a while, passing each message to a callback."""
+    deadline = asyncio.get_event_loop().time() + seconds
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            return
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        on_message(data)
+
+
+async def backfill(sender: str, name: str, days: float, collect_secs: float,
                    count: int, db_path: Path) -> int:
     import websockets
 
-    jid = to_jid(sender)
     want = "".join(c for c in sender if c.isdigit())
+    jid = to_jid(sender) if sender else ""
 
     print(f"Bridge:  {BRIDGE_URL}")
-    print(f"Chat:    {jid}")
+    print(f"Chat:    {jid or '(any)'}")
+    print(f"Name:    {name or '(any)'}")
     print(f"Window:  last {days:g} day(s)")
     print(f"Collect: {collect_secs:g}s\n")
 
-    seen, ingested, skipped_old, skipped_other = 0, 0, 0, 0
+    candidates: dict[str, dict] = {}
+    stats = defaultdict(int)
+
+    def on_message(data: dict) -> None:
+        kind = data.get("type")
+        if kind == "backfill_requested":
+            print(f"History requested (req {data.get('requestId')}) — listening...")
+            return
+        if kind == "error":
+            print(f"Bridge error: {data.get('error')}")
+            return
+        if kind != "message":
+            return
+        if data.get("mediaType") != "voice" and not data.get("mediaPath"):
+            return
+
+        stats["seen"] += 1
+        if not matches_sender(data, want, name):
+            stats["wrong_sender"] += 1
+            return
+        if not within_window(data.get("timestamp", 0), days):
+            stats["outside_window"] += 1
+            return
+        msg_id = data.get("id", "")
+        if msg_id:
+            candidates[msg_id] = data
 
     try:
-        async with websockets.connect(BRIDGE_URL) as ws:
-            await ws.send(json.dumps({"type": "backfill", "jid": jid, "count": count}))
+        async with websockets.connect(BRIDGE_URL, max_size=None) as ws:
+            if jid:
+                await ws.send(json.dumps({"type": "backfill", "jid": jid, "count": count}))
+            await _collect(ws, collect_secs, on_message)
 
-            deadline = asyncio.get_event_loop().time() + collect_secs
-            while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    break
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    break
+            print(f"\nVoice notes seen:  {stats['seen']}")
+            print(f"  wrong sender:    {stats['wrong_sender']}")
+            print(f"  outside window:  {stats['outside_window']}")
+            print(f"  MATCHED:         {len(candidates)}")
 
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+            if not candidates:
+                print("\nNothing matched. Try --list-senders to see who is actually in")
+                print("the replayed history, or widen --days.")
+                return 0
 
-                kind = data.get("type")
-                if kind == "backfill_requested":
-                    print(f"History requested (req {data.get('requestId')}) — listening...")
-                    continue
-                if kind == "error":
-                    print(f"Bridge error: {data.get('error')}")
-                    continue
-                if kind != "message":
-                    continue
+            # Phase 2: fetch audio only for what matched.
+            need = [i for i, m in candidates.items() if not m.get("mediaPath")]
+            paths: dict[str, str] = {
+                i: m["mediaPath"] for i, m in candidates.items() if m.get("mediaPath")
+            }
 
-                # Voice notes only.
-                if data.get("mediaType") != "voice" and not data.get("mediaPath"):
-                    continue
+            if need:
+                print(f"\nRequesting {len(need)} voice note download(s)...")
+                await ws.send(json.dumps({"type": "download", "ids": need}))
 
-                seen += 1
-                if not matches_sender(data, want):
-                    skipped_other += 1
-                    continue
-                if not within_window(data.get("timestamp", 0), days):
-                    skipped_old += 1
-                    continue
+                got = {}
 
+                def on_dl(data: dict) -> None:
+                    if data.get("type") == "downloaded":
+                        got.update(data.get("results") or {})
+
+                # Downloads are serialised bridge-side; allow generous time.
+                await _collect(ws, max(60.0, len(need) * 6.0), on_dl)
+                for k, v in got.items():
+                    if v:
+                        paths[k] = v
+
+            ingested = failed = 0
+            for msg_id, msg in candidates.items():
+                path = paths.get(msg_id, "")
+                if not path:
+                    failed += 1
                 result = ingest(
                     db_path,
-                    msg_id=data.get("id", ""),
-                    sender=data.get("pn") or data.get("sender", ""),
-                    ts=data.get("timestamp", 0),
-                    media=data.get("mediaPath", ""),
-                    from_me=data.get("fromMe", False),
+                    msg_id=msg_id,
+                    sender=msg.get("pn") or msg.get("sender", ""),
+                    ts=msg.get("timestamp", 0),
+                    media=path,
+                    from_me=msg.get("fromMe", False),
                 )
-                print(f"  {result}")
                 if result.startswith("OK"):
                     ingested += 1
+
+            print(f"\nIngested: {ingested}")
+            print(f"Audio unavailable (expired/failed): {failed}")
+            return 0
 
     except ConnectionRefusedError:
         print(f"Error: cannot reach the bridge at {BRIDGE_URL}.")
@@ -134,13 +212,73 @@ async def backfill(sender: str, days: float, collect_secs: float,
         print(f"Error: {e}")
         return 1
 
-    print(f"\nVoice notes seen: {seen}")
-    print(f"  ingested:       {ingested}")
-    print(f"  wrong sender:   {skipped_other}")
-    print(f"  outside window: {skipped_old}")
-    if seen == 0:
-        print("\nNo voice notes arrived. Either the phone did not replay history,")
-        print("or the chat has none in range. Check the bridge console output.")
+
+async def list_senders(days: float, collect_secs: float) -> int:
+    """Show whose voice notes are actually present, so you can pick a filter."""
+    import websockets
+
+    groups: dict[str, dict] = defaultdict(
+        lambda: {"n": 0, "latest": 0, "names": set(), "pn": set()}
+    )
+
+    def on_message(data: dict) -> None:
+        if data.get("type") != "message":
+            return
+        if data.get("mediaType") != "voice" and not data.get("mediaPath"):
+            return
+        ts = int(data.get("timestamp") or 0)
+        if days and not within_window(ts, days):
+            return
+        rec = groups[data.get("sender", "")]
+        rec["n"] += 1
+        rec["latest"] = max(rec["latest"], ts)
+        for f in ("contactName", "pushName"):
+            if data.get(f):
+                rec["names"].add(str(data[f]))
+        if data.get("pn"):
+            rec["pn"].add(str(data["pn"]))
+
+    try:
+        async with websockets.connect(BRIDGE_URL, max_size=None) as ws:
+            await _collect(ws, collect_secs, on_message)
+    except ConnectionRefusedError:
+        print(f"Error: cannot reach the bridge at {BRIDGE_URL}.")
+        return 1
+
+    if not groups:
+        print("No voice notes observed. The bridge may still be syncing.")
+        return 0
+
+    print(f"{'sender':<40} {'n':>4}  {'latest':<17} names / number")
+    for s, r in sorted(groups.items(), key=lambda kv: kv[1]["latest"], reverse=True):
+        label = ", ".join(sorted(r["names"])) or ", ".join(sorted(r["pn"])) or "-"
+        print(f"{s:<40} {r['n']:>4}  {fmt_ts(r['latest']):<17} {label}")
+    return 0
+
+
+async def contacts(query: str) -> int:
+    import websockets
+
+    try:
+        async with websockets.connect(BRIDGE_URL, max_size=None) as ws:
+            await ws.send(json.dumps({"type": "contacts", "query": query}))
+            found = []
+
+            def on_msg(data: dict) -> None:
+                if data.get("type") == "contacts":
+                    found.extend(data.get("contacts") or [])
+
+            await _collect(ws, 20, on_msg)
+    except ConnectionRefusedError:
+        print(f"Error: cannot reach the bridge at {BRIDGE_URL}.")
+        return 1
+
+    if not found:
+        print(f"No contacts matched {query!r}.")
+        return 0
+    for c in found[:40]:
+        name = c.get("name") or c.get("notify") or "-"
+        print(f"id={c.get('id',''):<36} phone={c.get('phone') or '-':<22} name={name}")
     return 0
 
 
@@ -149,26 +287,28 @@ async def health() -> int:
     import websockets
 
     try:
-        async with websockets.connect(BRIDGE_URL) as ws:
+        async with websockets.connect(BRIDGE_URL, max_size=None) as ws:
             await ws.send(json.dumps({"type": "health"}))
-            deadline = asyncio.get_event_loop().time() + 15
-            while asyncio.get_event_loop().time() < deadline:
-                raw = await asyncio.wait_for(ws.recv(), timeout=5)
-                data = json.loads(raw)
+            got = {}
+
+            def on_msg(data: dict) -> None:
                 if data.get("type") == "health":
-                    attempts = data.get("attempts", 0)
-                    successes = data.get("successes", 0)
-                    print(json.dumps(data, indent=2))
-                    if attempts >= 5 and successes == 0:
-                        print("\nUNHEALTHY: media downloads are attempted but never succeed.")
-                        print("The socket says connected, but the download path is broken.")
-                        return 1
-                    return 0
-            print("No health reply within 15s.")
-            return 1
+                    got.update(data)
+
+            await _collect(ws, 20, on_msg)
     except ConnectionRefusedError:
         print(f"Error: cannot reach the bridge at {BRIDGE_URL}.")
         return 1
+
+    if not got:
+        print("No health reply.")
+        return 1
+    print(json.dumps(got, indent=2))
+    if got.get("attempts", 0) >= 5 and got.get("successes", 0) == 0:
+        print("\nUNHEALTHY: downloads attempted but never succeeding.")
+        print("The socket says connected, but the download path is broken.")
+        return 1
+    return 0
 
 
 def self_test() -> int:
@@ -193,7 +333,21 @@ def self_test() -> int:
                          "923175081727"))
     check("rejects a different number",
           not matches_sender({"sender": "923009999999@s.whatsapp.net", "pn": ""}, "923175081727"))
-    check("empty want matches anything", matches_sender({"sender": "x@lid"}, ""))
+    check("empty criteria matches anything", matches_sender({"sender": "x@lid"}))
+
+    # Name matching is what rescues LID-only chats.
+    check("matches on contactName",
+          matches_sender({"sender": "999@lid", "contactName": "Ahmed Jasra"},
+                         "", "ahmed"))
+    check("matches on pushName",
+          matches_sender({"sender": "999@lid", "pushName": "Ahmed J"}, "", "ahmed"))
+    check("name match is case-insensitive",
+          matches_sender({"sender": "999@lid", "contactName": "AHMED JASRA"}, "", "Ahmed"))
+    check("rejects a different name",
+          not matches_sender({"sender": "999@lid", "contactName": "Bilal"}, "", "ahmed"))
+    check("number OR name is enough",
+          matches_sender({"sender": "923175081727@s.whatsapp.net", "contactName": "Someone"},
+                         "923175081727", "ahmed"))
 
     now = int(datetime.now(timezone.utc).timestamp())
     old = int((datetime.now(timezone.utc) - timedelta(days=5)).timestamp())
@@ -208,12 +362,17 @@ def self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Backfill WhatsApp voice notes")
     parser.add_argument("--sender", default="", help="phone number or JID to backfill")
+    parser.add_argument("--name", default="", help="match on contact/display name instead")
     parser.add_argument("--days", type=float, default=2)
     parser.add_argument("--collect", type=float, default=60,
                         help="seconds to listen for replayed history")
     parser.add_argument("--count", type=int, default=200,
                         help="how many historical messages to request")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument("--list-senders", action="store_true",
+                        help="show whose voice notes are present, then exit")
+    parser.add_argument("--contacts", default=None, metavar="QUERY",
+                        help="search the bridge address book, then exit")
     parser.add_argument("--health", action="store_true")
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
@@ -222,9 +381,15 @@ def main() -> int:
         return self_test()
     if args.health:
         return asyncio.run(health())
-    if not args.sender:
-        parser.error("--sender is required (or use --health / --test)")
-    return asyncio.run(backfill(args.sender, args.days, args.collect, args.count, args.db))
+    if args.contacts is not None:
+        return asyncio.run(contacts(args.contacts))
+    if args.list_senders:
+        return asyncio.run(list_senders(args.days, args.collect))
+    if not args.sender and not args.name:
+        parser.error("need --sender or --name (or --list-senders / --contacts / --health)")
+    return asyncio.run(
+        backfill(args.sender, args.name, args.days, args.collect, args.count, args.db)
+    )
 
 
 if __name__ == "__main__":

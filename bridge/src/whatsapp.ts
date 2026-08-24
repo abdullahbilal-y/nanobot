@@ -37,6 +37,8 @@ export interface InboundMessage {
   mediaPath?: string;
   mediaType?: string;
   durationSec?: number;
+  /** Audio is available but not downloaded yet; ask for it with 'download'. */
+  mediaPending?: boolean;
   /** True when this arrived via history sync/backfill rather than a live event. */
   historical?: boolean;
 }
@@ -62,6 +64,13 @@ interface MediaHealth {
   lastSuccessAt: number | null;
 }
 
+/** Just enough to fetch a voice note later, without holding the whole message. */
+interface PendingMedia {
+  mediaKey: unknown;
+  directPath: string;
+  url: string;
+}
+
 /** What we know about one address, merged from every source that mentions it. */
 export interface ContactRecord {
   id: string;
@@ -85,6 +94,16 @@ export class WhatsAppClient {
    * keep both ids pointing at one record.
    */
   private contacts = new Map<string, ContactRecord>();
+  /**
+   * Voice notes seen during history sync but deliberately NOT downloaded.
+   *
+   * A full sync is tens of thousands of messages; fetching every attachment
+   * inline starves a small box of memory and stalls the socket until WhatsApp
+   * drops it. Keep only the few fields needed to fetch on request, and let the
+   * consumer ask for the handful it actually wants.
+   */
+  private pendingMedia = new Map<string, PendingMedia>();
+  private static readonly MAX_PENDING = 20000;
   private health: MediaHealth = {
     attempts: 0,
     successes: 0,
@@ -115,9 +134,10 @@ export class WhatsAppClient {
       logger,
       printQRInTerminal: false,
       browser: ['nanobot', 'cli', VERSION],
-      // Pull history on link so voice notes sent before the bridge was running
-      // are still reachable for backfill.
-      syncFullHistory: true,
+      // Recent history only. A full sync is far more than this use case needs
+      // and is what pushes a small host into swapping/OOM; targeted windows
+      // come from fetchMessageHistory() instead.
+      syncFullHistory: false,
       markOnlineOnConnect: false,
     });
 
@@ -251,15 +271,22 @@ export class WhatsAppClient {
 
     const audio = msg.message?.audioMessage;
     let mediaPath: string | undefined;
+    let mediaPending = false;
 
-    // Download the voice note before deciding whether there is content, so a
-    // voice-only message still produces something useful downstream.
     if (audio) {
-      mediaPath = (await this.downloadVoice(msg)) ?? undefined;
+      if (historical) {
+        // Defer: remember how to fetch it, but don't spend memory or time on
+        // it now. The consumer asks for the ones it cares about.
+        this.rememberMedia(msg.key.id || '', audio);
+        mediaPending = true;
+      } else {
+        // Live traffic is low volume, so fetch inline and keep it simple.
+        mediaPath = (await this.downloadVoice(msg)) ?? undefined;
+      }
     }
 
     const content = this.extractMessageContent(msg);
-    if (!content && !mediaPath) return;
+    if (!content && !mediaPath && !mediaPending) return;
 
     const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
     const jid = msg.key.remoteJid || '';
@@ -285,6 +312,7 @@ export class WhatsAppClient {
       pushName: msg.pushName || undefined,
       contactName: known?.name || known?.notify || undefined,
       mediaPath,
+      mediaPending: mediaPending || undefined,
       mediaType: audio ? 'voice' : undefined,
       durationSec: audio?.seconds ? Number(audio.seconds) : undefined,
       historical,
@@ -338,6 +366,67 @@ export class WhatsAppClient {
       console.error(`Voice download failed for ${msg.key.id}: ${message}`);
       return null;
     }
+  }
+
+  /** Note how to fetch a voice note later, evicting oldest entries when full. */
+  private rememberMedia(id: string, audio: any): void {
+    if (!id || !audio?.mediaKey) return;
+
+    if (this.pendingMedia.size >= WhatsAppClient.MAX_PENDING) {
+      // Map iterates in insertion order, so the first key is the oldest.
+      const oldest = this.pendingMedia.keys().next().value;
+      if (oldest) this.pendingMedia.delete(oldest);
+    }
+    this.pendingMedia.set(id, {
+      mediaKey: audio.mediaKey,
+      directPath: audio.directPath,
+      url: audio.url,
+    });
+  }
+
+  /**
+   * Fetch previously deferred voice notes by message id.
+   *
+   * Downloads run one at a time on purpose: this host has under a gigabyte of
+   * RAM, and the point of deferring was to stop bulk media work from
+   * overwhelming it.
+   */
+  async downloadByIds(ids: string[]): Promise<Record<string, string | null>> {
+    const out: Record<string, string | null> = {};
+
+    for (const id of ids || []) {
+      const pending = this.pendingMedia.get(id);
+      if (!pending) {
+        out[id] = null;
+        continue;
+      }
+
+      const safeId = id.replace(/[^A-Za-z0-9_-]/g, '');
+      const file = join(this.mediaDir, `${safeId}.ogg`);
+
+      this.health.attempts++;
+      try {
+        const stream = await downloadContentFromMessage(pending as any, 'audio');
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream as any) {
+          chunks.push(chunk as Buffer);
+        }
+        const buf = Buffer.concat(chunks);
+        if (!buf.length) throw new Error('empty payload');
+
+        await writeFile(file, buf);
+        this.health.successes++;
+        this.health.lastSuccessAt = Date.now();
+        out[id] = file;
+        console.log(`🎙️  Fetched deferred voice note ${safeId}.ogg (${buf.length} bytes)`);
+      } catch (error) {
+        const message = (error as Error).message;
+        this.health.lastError = message;
+        console.error(`Deferred download failed for ${id}: ${message}`);
+        out[id] = null;
+      }
+    }
+    return out;
   }
 
   /**
