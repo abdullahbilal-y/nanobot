@@ -21,10 +21,15 @@ interface HealthCommand {
   type: 'health';
 }
 
-type BridgeCommand = SendCommand | BackfillCommand | HealthCommand;
+interface ContactsCommand {
+  type: 'contacts';
+  query?: string;
+}
+
+type BridgeCommand = SendCommand | BackfillCommand | HealthCommand | ContactsCommand;
 
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error' | 'health';
+  type: 'message' | 'status' | 'qr' | 'error' | 'health' | 'contacts';
   [key: string]: unknown;
 }
 
@@ -98,6 +103,9 @@ export class BridgeServer {
 
       case 'health':
         return { type: 'health', ...this.wa.getHealth() };
+
+      case 'contacts':
+        return { type: 'contacts', contacts: this.wa.findContacts(cmd.query || '') };
 
       default:
         return { type: 'error', error: `Unknown command: ${JSON.stringify(cmd)}` };

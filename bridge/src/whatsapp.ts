@@ -29,6 +29,10 @@ export interface InboundMessage {
   timestamp: number;
   isGroup: boolean;
   fromMe?: boolean;
+  /** Display name the sender set on WhatsApp, when the message carries one. */
+  pushName?: string;
+  /** Contact name as saved in the linked account's address book, if known. */
+  contactName?: string;
   /** Local path to a downloaded voice note, when the message carried one. */
   mediaPath?: string;
   mediaType?: string;
@@ -58,11 +62,29 @@ interface MediaHealth {
   lastSuccessAt: number | null;
 }
 
+/** What we know about one address, merged from every source that mentions it. */
+export interface ContactRecord {
+  id: string;
+  lid?: string;
+  phone?: string;
+  name?: string;
+  notify?: string;
+}
+
 export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
   private mediaDir: string;
+  /**
+   * Address book, keyed by every id we have seen for a contact.
+   *
+   * WhatsApp increasingly addresses chats by an opaque LID rather than the
+   * phone number, and messages do not carry the number. The contact list that
+   * arrives with history sync is what ties the two together, so index it and
+   * keep both ids pointing at one record.
+   */
+  private contacts = new Map<string, ContactRecord>();
   private health: MediaHealth = {
     attempts: 0,
     successes: 0,
@@ -143,13 +165,24 @@ export class WhatsAppClient {
 
     // History sync — fires on initial link and in response to fetchMessageHistory().
     // Same message shape as live events, so both go through one path.
-    this.sock.ev.on('messaging-history.set', async ({ messages }: { messages: any[] }) => {
+    this.sock.ev.on('messaging-history.set', async (
+      { messages, contacts }: { messages: any[]; contacts?: any[] }
+    ) => {
+      // Index contacts first, so messages in this same batch can resolve.
+      if (contacts?.length) {
+        this.indexContacts(contacts);
+        console.log(`👤 History sync: ${contacts.length} contacts (${this.contacts.size} known)`);
+      }
       if (!messages?.length) return;
       console.log(`📜 History sync: ${messages.length} messages`);
       for (const msg of messages) {
         await this.emitMessage(msg, true);
       }
     });
+
+    // Contact updates outside of history sync.
+    this.sock.ev.on('contacts.upsert', (contacts: any[]) => this.indexContacts(contacts));
+    this.sock.ev.on('contacts.update', (contacts: any[]) => this.indexContacts(contacts));
 
     // Handle incoming messages
     this.sock.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
@@ -159,6 +192,56 @@ export class WhatsAppClient {
         await this.emitMessage(msg, false);
       }
     });
+  }
+
+  /** Merge contacts into the address book under every id they expose. */
+  private indexContacts(contacts: any[]): void {
+    for (const c of contacts || []) {
+      if (!c?.id) continue;
+
+      const ids = [c.id, c.lid, c.phoneNumber].filter(Boolean) as string[];
+      // Reuse an existing record if any of these ids is already known, so the
+      // LID and the phone number converge on one entry.
+      let rec: ContactRecord | undefined;
+      for (const id of ids) {
+        rec = this.contacts.get(id);
+        if (rec) break;
+      }
+      if (!rec) rec = { id: c.id };
+
+      if (c.lid) rec.lid = c.lid;
+      if (c.phoneNumber) rec.phone = c.phoneNumber;
+      // Don't let a later empty update erase a name we already have.
+      if (c.name) rec.name = c.name;
+      if (c.notify) rec.notify = c.notify;
+
+      for (const id of ids) {
+        this.contacts.set(id, rec);
+      }
+    }
+  }
+
+  /** Best-known phone JID for an address, or '' when we cannot resolve one. */
+  private resolvePhone(jid: string): string {
+    if (!jid) return '';
+    if (jid.endsWith('@s.whatsapp.net')) return jid;
+    return this.contacts.get(jid)?.phone || '';
+  }
+
+  /** Search the address book by name or by digits of the number. */
+  findContacts(query: string): ContactRecord[] {
+    const q = (query || '').toLowerCase().trim();
+    const digits = q.replace(/\D/g, '');
+    const out = new Map<ContactRecord, true>();
+
+    for (const rec of this.contacts.values()) {
+      const name = `${rec.name || ''} ${rec.notify || ''}`.toLowerCase();
+      const phone = (rec.phone || '').replace(/\D/g, '');
+      const hitName = q.length > 0 && name.includes(q);
+      const hitPhone = digits.length >= 6 && phone.includes(digits);
+      if (!q || hitName || hitPhone) out.set(rec, true);
+    }
+    return [...out.keys()];
   }
 
   /** Normalize a live or historical message and hand it to the bridge. */
@@ -179,15 +262,28 @@ export class WhatsAppClient {
     if (!content && !mediaPath) return;
 
     const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
+    const jid = msg.key.remoteJid || '';
+
+    // A pushName is free identity information; record it so the address book
+    // can name a contact even when history sync never listed them.
+    if (msg.pushName && jid && !isGroup) {
+      this.indexContacts([{ id: jid, notify: msg.pushName }]);
+    }
+
+    // remoteJidAlt is usually absent, so fall back to the address book.
+    const pn = msg.key.remoteJidAlt || this.resolvePhone(jid);
+    const known = this.contacts.get(jid);
 
     this.options.onMessage({
       id: msg.key.id || '',
-      sender: msg.key.remoteJid || '',
-      pn: msg.key.remoteJidAlt || '',
+      sender: jid,
+      pn,
       content: content || '[Voice Message]',
       timestamp: Number(msg.messageTimestamp) || 0,
       isGroup,
       fromMe: !!msg.key.fromMe,
+      pushName: msg.pushName || undefined,
+      contactName: known?.name || known?.notify || undefined,
       mediaPath,
       mediaType: audio ? 'voice' : undefined,
       durationSec: audio?.seconds ? Number(audio.seconds) : undefined,
