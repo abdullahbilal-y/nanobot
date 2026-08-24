@@ -20,7 +20,7 @@ WhatsApp voice note
       │        (duplicate id = no-op, so replay/backfill is always safe)
       ▼
    transcribe (Groq whisper-large-v3)      ┐ best-effort:
-   extract    (Groq llama-3.3-70b, JSON)   ┘ failures are recorded, never fatal
+   extract    (Groq gpt-oss-120b, JSON)    ┘ failures are recorded, never fatal
       ▼
    summarize → digest text → send_whatsapp
 ```
@@ -91,7 +91,7 @@ a code edit:
 python voicemail_store.py settings --set watch_sender=923001234567 \
                                    --set watch_name="Ahmed Jasra" \
                                    --set target_jid=923175081727
-python voicemail_store.py settings --set extract_model=llama-3.3-70b-versatile
+python voicemail_store.py settings --set extract_model=openai/gpt-oss-120b
 ```
 
 ## Health

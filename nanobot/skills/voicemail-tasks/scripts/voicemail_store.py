@@ -30,7 +30,9 @@ GROQ_BASE = "https://api.groq.com/openai/v1"
 # Model ids move faster than this file does, so they are settings, not constants.
 DEFAULT_SETTINGS = {
     "transcribe_model": "whisper-large-v3",
-    "extract_model": "llama-3.3-70b-versatile",
+    # Groq's catalogue shifts; check `GET /openai/v1/models` for what your key
+    # actually has before changing this.
+    "extract_model": "openai/gpt-oss-120b",
     "target_jid": "",       # where summaries get sent
     "watch_sender": "",     # whose voice notes become tasks
     "watch_name": "",
@@ -117,8 +119,29 @@ def ingest(db_path: Path, msg_id: str, sender: str, ts: int, media: str = "",
 
 # ---------------------------------------------------------------- enrichment
 
+NANOBOT_CONFIG = Path(os.environ.get("NANOBOT_CONFIG", Path.home() / ".nanobot" / "config.json"))
+
+
 def _groq_key() -> str:
-    return os.environ.get("GROQ_API_KEY", "")
+    """Env first, then nanobot's own config.
+
+    The daemon usually runs without GROQ_API_KEY exported — the key lives in
+    ~/.nanobot/config.json, which nanobot writes in camelCase. Accept either
+    spelling so this works whichever way the config was produced.
+    """
+    key = os.environ.get("GROQ_API_KEY", "")
+    if key:
+        return key
+
+    try:
+        cfg = json.loads(NANOBOT_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    groq = (cfg.get("providers") or {}).get("groq") or {}
+    if not isinstance(groq, dict):
+        return ""
+    return groq.get("apiKey") or groq.get("api_key") or ""
 
 
 def transcribe_pending(db_path: Path, limit: int = 20) -> str:
@@ -462,6 +485,33 @@ def self_test() -> int:
     s = settings_cmd(tmp, ["watch_name=Ahmed Jasra"])
     check("setting persisted", "Ahmed Jasra" in s)
     check("unknown setting rejected", settings_cmd(tmp, ["bogus=1"]).startswith("Error"))
+
+    # Key resolution: env wins, then camelCase config, then snake_case.
+    global NANOBOT_CONFIG
+    saved_cfg, saved_env = NANOBOT_CONFIG, os.environ.pop("GROQ_API_KEY", None)
+    try:
+        cfg_path = tmp.parent / "config.json"
+        NANOBOT_CONFIG = cfg_path
+
+        cfg_path.write_text(json.dumps({"providers": {"groq": {"apiKey": "FROM_CAMEL"}}}))
+        check("key read from camelCase config", _groq_key() == "FROM_CAMEL")
+
+        cfg_path.write_text(json.dumps({"providers": {"groq": {"api_key": "FROM_SNAKE"}}}))
+        check("key read from snake_case config", _groq_key() == "FROM_SNAKE")
+
+        os.environ["GROQ_API_KEY"] = "FROM_ENV"
+        check("env overrides config", _groq_key() == "FROM_ENV")
+        del os.environ["GROQ_API_KEY"]
+
+        cfg_path.write_text("{ not json")
+        check("corrupt config yields empty key", _groq_key() == "")
+
+        cfg_path.unlink()
+        check("missing config yields empty key", _groq_key() == "")
+    finally:
+        NANOBOT_CONFIG = saved_cfg
+        if saved_env is not None:
+            os.environ["GROQ_API_KEY"] = saved_env
 
     print(f"\n{'ALL PASSED' if not failures else str(len(failures)) + ' FAILED'}")
     return 1 if failures else 0
