@@ -36,6 +36,9 @@ DEFAULT_SETTINGS = {
     "target_jid": "",       # where summaries get sent
     "watch_sender": "",     # whose voice notes become tasks
     "watch_name": "",
+    # Spoken language of the voice notes. Telling Whisper up front is markedly
+    # more accurate than letting it guess, especially on short or noisy clips.
+    "transcribe_language": "ur",
 }
 
 
@@ -154,6 +157,7 @@ def transcribe_pending(db_path: Path, limit: int = 20) -> str:
 
     data = _load(db_path)
     model = data["settings"]["transcribe_model"]
+    language = (data["settings"].get("transcribe_language") or "").strip()
     pending = [
         m for m in data["messages"].values()
         if m.get("media_path") and not m.get("transcript")
@@ -172,10 +176,17 @@ def transcribe_pending(db_path: Path, limit: int = 20) -> str:
         try:
             with httpx.Client(timeout=120.0) as client:
                 with open(path, "rb") as fh:
+                    files = {"file": (path.name, fh), "model": (None, model)}
+                    # Transcribe in the spoken language; do NOT ask Whisper to
+                    # translate. The raw transcript is the record, and
+                    # romanisation/translation happen downstream where they can
+                    # be redone without re-uploading audio.
+                    if language:
+                        files["language"] = (None, language)
                     resp = client.post(
                         f"{GROQ_BASE}/audio/transcriptions",
                         headers={"Authorization": f"Bearer {key}"},
-                        files={"file": (path.name, fh), "model": (None, model)},
+                        files=files,
                     )
             resp.raise_for_status()
             msg["transcript"] = resp.json().get("text", "").strip()
@@ -191,17 +202,32 @@ def transcribe_pending(db_path: Path, limit: int = 20) -> str:
     return f"Transcribed {done}, failed {failed}."
 
 
-EXTRACT_PROMPT = """You extract ACTION ITEMS from a voice note transcript.
+EXTRACT_PROMPT = """You process a voice note transcript. The speaker talks in Urdu, \
+often mixing in English words, and is dictating work for the listener to do.
 
-The speaker is dictating work for the listener to do. Return ONLY a JSON object:
-{"tasks": [{"text": "...", "priority": "high|normal|low", "due": "<date or empty>"}]}
+Return ONLY a JSON object:
+{
+  "roman_urdu": "<the transcript in Roman Urdu>",
+  "tasks": [{"text": "<action item in English>", "priority": "high|normal|low", "due": "<date or empty>"}]
+}
 
-Rules:
-- One entry per distinct actionable item. Keep the speaker's own wording where possible.
-- Preserve names, numbers, amounts and dates EXACTLY as spoken. Never invent or normalise them.
-- If the transcript contains no action item (small talk, a greeting), return {"tasks": []}.
-- Do not merge two separate requests into one task, and do not split one request into several.
-- Output raw JSON only, no markdown fence, no commentary."""
+roman_urdu rules:
+- Transliterate what was said into Latin script. Do NOT translate it to English \
+and do NOT summarise it — a reader who knows spoken Urdu should recognise the \
+same sentences.
+- Words the speaker actually said in English stay in English, spelled normally.
+- If the transcript is already in Latin script, return it essentially unchanged.
+
+tasks rules:
+- Write each action item in clear, natural English — this is a task list an \
+English reader will work from.
+- One entry per distinct actionable item. Do not merge two separate requests \
+into one, and do not split one request into several.
+- Preserve names, numbers, amounts, reference codes and dates EXACTLY as \
+spoken, in both fields. Never invent, translate or normalise them.
+- If there is no action item (small talk, a greeting), return "tasks": [].
+
+Output raw JSON only, no markdown fence, no commentary."""
 
 
 def extract_pending(db_path: Path, limit: int = 20) -> str:
@@ -244,6 +270,12 @@ def extract_pending(db_path: Path, limit: int = 20) -> str:
             resp.raise_for_status()
             payload = json.loads(resp.json()["choices"][0]["message"]["content"])
 
+            # Keep the raw transcript untouched and store the romanisation
+            # alongside it, so a bad transliteration is always recoverable.
+            roman = (payload.get("roman_urdu") or "").strip()
+            if roman:
+                msg["transcript_roman"] = roman
+
             for item in payload.get("tasks", []):
                 text = (item.get("text") or "").strip()
                 if not text:
@@ -273,6 +305,16 @@ def extract_pending(db_path: Path, limit: int = 20) -> str:
 
 
 # ---------------------------------------------------------------- reporting
+
+def _display_text(msg: dict) -> str:
+    """What a human should read: Roman Urdu when we have it, else the raw text.
+
+    The raw transcript stays on the record either way; this only chooses what
+    to show, so a romanisation failure degrades to the original rather than
+    hiding the message.
+    """
+    return (msg.get("transcript_roman") or msg.get("transcript") or "").strip()
+
 
 def _within(ts: int, days: float) -> bool:
     if not ts:
@@ -346,8 +388,8 @@ def summarize(db_path: Path, days: float = 2, sender: str = "") -> str:
     lines += ["", "VOICE NOTES"]
     for m in sorted(msgs, key=lambda x: x.get("timestamp", 0)):
         stamp = _fmt_ts(m.get("timestamp", 0))
-        if m.get("transcript"):
-            text = m["transcript"]
+        text = _display_text(m)
+        if text:
             snippet = text if len(text) <= 300 else text[:300] + "..."
             lines.append(f"- {stamp}: {snippet}")
         else:
@@ -375,8 +417,9 @@ def digest_for_message(db_path: Path, msg_id: str) -> str:
 
     lines = [f"Voice note from {name} — {stamp}", ""]
 
-    if msg.get("transcript"):
-        lines += ["Transcript:", msg["transcript"], ""]
+    body = _display_text(msg)
+    if body:
+        lines += ["Transcript:", body, ""]
     else:
         why = msg.get("transcript_error", "not transcribed")
         lines += [f"[audio could not be transcribed — {why}]",
@@ -481,6 +524,34 @@ def self_test() -> int:
     summary = summarize(tmp, days=2)
     check("summary includes recent transcript", "send the invoice tomorrow" in summary)
     check("old message outside window excluded", "call the supplier" not in summary)
+
+    # Roman Urdu is what a human reads; the raw transcript stays on the record.
+    urdu = "مجھے کل انوائس بھیج دیں"
+    roman = "mujhe kal invoice bhej dein"
+    ingest(tmp, "MSG3", "923175081727", int(datetime.now(timezone.utc).timestamp()),
+           transcript=urdu)
+    d3 = _load(tmp)
+    d3["messages"]["MSG3"]["transcript_roman"] = roman
+    _save(tmp, d3)
+
+    check("display prefers roman urdu", _display_text(_load(tmp)["messages"]["MSG3"]) == roman)
+    check("raw urdu transcript is preserved",
+          _load(tmp)["messages"]["MSG3"]["transcript"] == urdu)
+    check("digest shows roman, not urdu script",
+          roman in digest_for_message(tmp, "MSG3")
+          and urdu not in digest_for_message(tmp, "MSG3"))
+    check("summary shows roman urdu", roman in summarize(tmp, days=2))
+
+    # Falling back matters: a romanisation failure must not hide the message.
+    d3 = _load(tmp)
+    del d3["messages"]["MSG3"]["transcript_roman"]
+    _save(tmp, d3)
+    check("falls back to raw transcript when roman missing",
+          _display_text(_load(tmp)["messages"]["MSG3"]) == urdu)
+    check("digest still renders without roman", urdu in digest_for_message(tmp, "MSG3"))
+
+    check("urdu is the default transcribe language",
+          _load(tmp)["settings"]["transcribe_language"] == "ur")
 
     s = settings_cmd(tmp, ["watch_name=Ahmed Jasra"])
     check("setting persisted", "Ahmed Jasra" in s)

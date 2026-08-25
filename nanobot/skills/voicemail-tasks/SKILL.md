@@ -19,14 +19,32 @@ WhatsApp voice note
    ingest  ── keyed on the WhatsApp message id → ~/.nanobot/voicemail_tasks.json
       │        (duplicate id = no-op, so replay/backfill is always safe)
       ▼
-   transcribe (Groq whisper-large-v3)      ┐ best-effort:
+   transcribe (Groq whisper-large-v3, ur)  ┐ best-effort:
    extract    (Groq gpt-oss-120b, JSON)    ┘ failures are recorded, never fatal
+              → Roman Urdu transcript + English tasks
       ▼
    summarize → digest text → send_whatsapp
 ```
 
 The audio and the raw transcript are always kept. If extraction fails, the voice
 note still shows up in the digest as a transcript, so nothing is silently lost.
+
+## Languages
+
+Ahmad's voice notes are spoken in Urdu, so the pipeline splits the two jobs:
+
+- **Whisper transcribes in Urdu** (`transcribe_language=ur`) and is never asked
+  to translate. That raw Urdu transcript is the record and is kept verbatim.
+- **The extraction step returns two things**: the same transcript transliterated
+  into **Roman Urdu** (for reading), and the action items rewritten in
+  **English** (for the task list).
+
+Doing the romanisation downstream rather than in Whisper means it can be redone
+— with a better prompt or model — without re-uploading any audio.
+
+Display prefers `transcript_roman` and falls back to the raw transcript, so a
+romanisation failure degrades to Urdu script rather than hiding the message.
+Names, numbers and reference codes are preserved exactly in both fields.
 
 ## Prerequisites
 
