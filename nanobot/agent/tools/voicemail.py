@@ -51,7 +51,7 @@ class VoicemailTasksTool(Tool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "summary", "done", "stats", "reset"],
+                "enum": ["list", "summary", "done", "reopen", "stats", "reset"],
                 "description": "What to do. Default 'list'.",
             },
             "status": {
@@ -66,7 +66,7 @@ class VoicemailTasksTool(Tool):
             },
             "task_id": {
                 "type": "integer",
-                "description": "For 'done': the task number to mark complete.",
+                "description": "For 'done'/'reopen': the task number to act on.",
             },
         },
         "required": [],
@@ -98,6 +98,11 @@ class VoicemailTasksTool(Tool):
                 if task_id is None:
                     return "Error: 'task_id' is required to mark a task done."
                 return store.mark_done(db, int(task_id))
+
+            if action == "reopen":
+                if task_id is None:
+                    return "Error: 'task_id' is required to reopen a task."
+                return store.mark_open(db, int(task_id))
 
             if action == "stats":
                 return store.stats(db)

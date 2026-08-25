@@ -456,6 +456,18 @@ def mark_done(db_path: Path, task_id: int) -> str:
     return f"Error: no task #{task_id}."
 
 
+def mark_open(db_path: Path, task_id: int) -> str:
+    """Reopen a task. Needed because 'done' is one keystroke away by chat."""
+    data = _load(db_path)
+    for t in data["tasks"]:
+        if t["id"] == task_id:
+            t["status"] = "open"
+            t.pop("completed_at", None)
+            _save(db_path, data)
+            return f"OK: task #{task_id} reopened."
+    return f"Error: no task #{task_id}."
+
+
 def reset(db_path: Path, wipe_messages: bool = False) -> str:
     """Clear the task list, keeping a timestamped backup first.
 
@@ -559,6 +571,13 @@ def self_test() -> int:
     check("done filter excludes open task", list_tasks(tmp, status="done") == "No tasks found.")
     check("mark done works", mark_done(tmp, 1).startswith("OK"))
     check("missing task id reports error", mark_done(tmp, 99).startswith("Error"))
+    check("reopen works", mark_open(tmp, 1).startswith("OK"))
+    check("reopened task is open again",
+          next(t for t in _load(tmp)["tasks"] if t["id"] == 1)["status"] == "open")
+    check("reopen clears completed_at",
+          "completed_at" not in next(t for t in _load(tmp)["tasks"] if t["id"] == 1))
+    check("reopen of missing id errors", mark_open(tmp, 99).startswith("Error"))
+    mark_done(tmp, 1)
 
     recent = ingest(tmp, "MSG2", "923175081727", int(datetime.now(timezone.utc).timestamp()),
                     transcript="send the invoice tomorrow")
@@ -681,6 +700,9 @@ def main() -> int:
     p = sub.add_parser("done")
     p.add_argument("--task", type=int, required=True)
 
+    p = sub.add_parser("reopen")
+    p.add_argument("--task", type=int, required=True)
+
     p = sub.add_parser("settings")
     p.add_argument("--set", dest="assignments", action="append", default=[])
 
@@ -708,6 +730,8 @@ def main() -> int:
         print(list_tasks(args.db, args.status, args.days, args.sender))
     elif args.cmd == "done":
         print(mark_done(args.db, args.task))
+    elif args.cmd == "reopen":
+        print(mark_open(args.db, args.task))
     elif args.cmd == "settings":
         print(settings_cmd(args.db, args.assignments))
     elif args.cmd == "reset":
