@@ -456,6 +456,41 @@ def mark_done(db_path: Path, task_id: int) -> str:
     return f"Error: no task #{task_id}."
 
 
+def reset(db_path: Path, wipe_messages: bool = False) -> str:
+    """Clear the task list, keeping a timestamped backup first.
+
+    By default the ingested voice notes stay and are marked un-extracted, so a
+    later `extract` rebuilds the list with the current prompt — useful when the
+    tasks were produced by an older, worse one. Settings are always preserved.
+    """
+    data = _load(db_path)
+    n_tasks = len(data["tasks"])
+    n_msgs = len(data["messages"])
+
+    if db_path.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup = db_path.with_name(f"{db_path.stem}.{stamp}.bak.json")
+        backup.write_text(db_path.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        backup = None
+
+    data["tasks"] = []
+    if wipe_messages:
+        data["messages"] = {}
+    else:
+        for m in data["messages"].values():
+            m["extracted"] = False
+
+    _save(db_path, data)
+
+    parts = [f"Cleared {n_tasks} task(s)"]
+    parts.append(f"wiped {n_msgs} voice note(s)" if wipe_messages
+                 else f"kept {n_msgs} voice note(s), marked for re-extraction")
+    if backup:
+        parts.append(f"backup: {backup.name}")
+    return ". ".join(parts) + "."
+
+
 def settings_cmd(db_path: Path, assignments: list[str]) -> str:
     data = _load(db_path)
     for pair in assignments or []:
@@ -560,6 +595,23 @@ def self_test() -> int:
     check("urdu is the default transcribe language",
           _load(tmp)["settings"]["transcribe_language"] == "ur")
 
+    # Reset clears tasks, keeps notes and settings, and allows re-extraction.
+    before = _load(tmp)
+    n_before = len(before["messages"])
+    settings_cmd(tmp, ["watch_name=Reset Check"])
+    r = reset(tmp)
+    after = _load(tmp)
+    check("reset reports what it cleared", "Cleared" in r)
+    check("reset empties the task list", after["tasks"] == [])
+    check("reset keeps voice notes", len(after["messages"]) == n_before)
+    check("reset marks notes for re-extraction",
+          all(m.get("extracted") is False for m in after["messages"].values()))
+    check("reset preserves settings", after["settings"]["watch_name"] == "Reset Check")
+    check("reset wrote a backup",
+          any(f.name.endswith(".bak.json") for f in tmp.parent.iterdir()))
+    check("reset --all wipes notes too", "wiped" in reset(tmp, wipe_messages=True))
+    check("notes gone after wipe", _load(tmp)["messages"] == {})
+
     s = settings_cmd(tmp, ["watch_name=Ahmed Jasra"])
     check("setting persisted", "Ahmed Jasra" in s)
     check("unknown setting rejected", settings_cmd(tmp, ["bogus=1"]).startswith("Error"))
@@ -632,6 +684,10 @@ def main() -> int:
     p = sub.add_parser("settings")
     p.add_argument("--set", dest="assignments", action="append", default=[])
 
+    p = sub.add_parser("reset")
+    p.add_argument("--all", dest="wipe", action="store_true",
+                   help="also remove ingested voice notes, not just tasks")
+
     sub.add_parser("stats")
 
     args = parser.parse_args()
@@ -654,6 +710,8 @@ def main() -> int:
         print(mark_done(args.db, args.task))
     elif args.cmd == "settings":
         print(settings_cmd(args.db, args.assignments))
+    elif args.cmd == "reset":
+        print(reset(args.db, args.wipe))
     elif args.cmd == "stats":
         print(stats(args.db))
     else:

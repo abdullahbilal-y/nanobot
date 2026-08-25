@@ -98,6 +98,10 @@ class AgentLoop:
         
         # WhatsApp outreach tool
         self.tools.register(SendWhatsAppTool())
+
+        # Voicemail task list (built by the voicemail-tasks watcher)
+        from nanobot.agent.tools.voicemail import VoicemailTasksTool
+        self.tools.register(VoicemailTasksTool())
         
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
