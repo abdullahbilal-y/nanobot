@@ -26,7 +26,7 @@ from voicemail_store import (  # noqa: E402
     DEFAULT_DB, _load, _save, digest_for_message, extract_pending, ingest,
     transcribe_pending,
 )
-from wa_backfill import BRIDGE_URL, matches_sender, to_jid  # noqa: E402
+from wa_backfill import BRIDGE_URL, should_process, to_jid  # noqa: E402
 
 
 def build_digest(db_path: Path, msg_id: str) -> str:
@@ -47,7 +47,7 @@ def build_digest(db_path: Path, msg_id: str) -> str:
 
 
 async def watch(sender: str, target: str, db_path: Path, dry_run: bool,
-                name: str = "") -> int:
+                name: str = "", self_ids: str = "", include_groups: bool = False) -> int:
     import websockets
 
     want = "".join(c for c in sender if c.isdigit())
@@ -56,6 +56,8 @@ async def watch(sender: str, target: str, db_path: Path, dry_run: bool,
     print(f"Bridge:  {BRIDGE_URL}")
     print(f"Watching voice notes from: {sender or '(any number)'} / name {name or '(any)'}")
     print(f"Digest goes to: {target_jid or '(dry run — nothing sent)'}")
+    print(f"Groups: {'included' if include_groups else 'ignored'}")
+    print(f"Self-chat forwards: {self_ids or '(not configured)'}")
     print("Ctrl-C to stop.\n")
 
     while True:
@@ -72,7 +74,10 @@ async def watch(sender: str, target: str, db_path: Path, dry_run: bool,
                         continue
                     if not data.get("mediaPath"):
                         continue
-                    if not matches_sender(data, want, name):
+                    accept, why = should_process(
+                        data, want, name, self_ids, include_groups
+                    )
+                    if not accept:
                         continue
 
                     msg_id = data.get("id", "")
@@ -84,7 +89,7 @@ async def watch(sender: str, target: str, db_path: Path, dry_run: bool,
                         media=data.get("mediaPath", ""),
                         from_me=data.get("fromMe", False),
                     )
-                    print(f"{result}")
+                    print(f"{result} [{why}]")
 
                     # Already handled — a replay must not re-send a digest.
                     if not result.startswith("OK"):
@@ -183,6 +188,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Watch WhatsApp voice notes")
     parser.add_argument("--sender", default="", help="whose voice notes to watch")
     parser.add_argument("--name", default="", help="match on contact/display name instead")
+    parser.add_argument("--self-jid", default="", dest="self_jid",
+                        help="your own address(es); notes you forward yourself are picked up")
     parser.add_argument("--target", default=os.environ.get("VOICEMAIL_TARGET", ""),
                         help="number to send digests to")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -199,11 +206,16 @@ def main() -> int:
     sender = args.sender or data["settings"].get("watch_sender", "")
     target = args.target or data["settings"].get("target_jid", "")
     name = args.name or data["settings"].get("watch_name", "")
+    self_ids = args.self_jid or data["settings"].get("self_jid", "")
+    include_groups = str(
+        data["settings"].get("include_groups", "false")
+    ).strip().lower() in ("1", "true", "yes")
     if not sender and not name:
         parser.error("need --sender or --name (or set watch_sender/watch_name in settings)")
 
     try:
-        return asyncio.run(watch(sender, target, args.db, args.dry_run, name))
+        return asyncio.run(watch(sender, target, args.db, args.dry_run, name,
+                                 self_ids, include_groups))
     except KeyboardInterrupt:
         print("\nStopped.")
         return 0

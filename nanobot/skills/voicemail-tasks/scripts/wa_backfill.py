@@ -75,6 +75,57 @@ def matches_sender(msg: dict, want_digits: str = "", want_name: str = "") -> boo
     return False
 
 
+def _ids_of(value: str) -> list[str]:
+    """Split a comma-separated identifier setting into clean entries."""
+    return [p.strip() for p in str(value or "").split(",") if p.strip()]
+
+
+def is_self_chat(msg: dict, self_ids: str) -> bool:
+    """True when the message sits in the account's own 'message yourself' chat.
+
+    Forwarding a voice note to yourself is the deliberate way to pull one in
+    that would otherwise be skipped, so the self-chat is always in scope.
+    Matched on the chat address, not on fromMe — a message you send *to someone
+    else* is also fromMe and must not qualify.
+    """
+    if not self_ids:
+        return False
+
+    sender = str(msg.get("sender", ""))
+    sender_digits = digits_of(sender)
+
+    for ident in _ids_of(self_ids):
+        if ident.endswith("@lid"):
+            # LIDs carry a device suffix (123:19@lid); compare the user part.
+            if sender.split(":")[0].split("@")[0] == ident.split(":")[0].split("@")[0]:
+                return True
+            continue
+        want = digits_of(ident)
+        if want and sender_digits and sender_digits.endswith(want[-9:]):
+            return True
+    return False
+
+
+def should_process(msg: dict, want_digits: str = "", want_name: str = "",
+                   self_ids: str = "", include_groups: bool = False) -> tuple[bool, str]:
+    """Decide whether a voice note belongs in the task list.
+
+    Returns (accept, reason) so callers can report why something was skipped
+    instead of it vanishing silently.
+    """
+    # Anything forwarded into the self-chat is wanted, group rules aside.
+    if is_self_chat(msg, self_ids):
+        return True, "forwarded-to-self"
+
+    if msg.get("isGroup") and not include_groups:
+        return False, "group"
+
+    if matches_sender(msg, want_digits, want_name):
+        return True, "direct"
+
+    return False, "other-sender"
+
+
 def within_window(ts: int, days: float) -> bool:
     if not ts:
         return False
@@ -383,6 +434,36 @@ def self_test() -> int:
     check("number OR name is enough",
           matches_sender({"sender": "923175081727@s.whatsapp.net", "contactName": "Someone"},
                          "923175081727", "ahmed"))
+
+    # Routing: groups out, direct messages in, self-forwards always in.
+    AHMAD = "73439947845638@lid"
+    SELF = "923175081727,225537473675300@lid"
+    direct = {"sender": AHMAD, "isGroup": False}
+    in_group = {"sender": "120363100352873276@g.us", "isGroup": True,
+                "pushName": "Ahmad Jasra"}
+    selfchat = {"sender": "923175081727@s.whatsapp.net", "isGroup": False, "fromMe": True}
+    selflid = {"sender": "225537473675300:19@lid", "isGroup": False, "fromMe": True}
+    other = {"sender": "923009999999@s.whatsapp.net", "isGroup": False}
+
+    check("direct note from Ahmad accepted",
+          should_process(direct, "73439947845638", "", SELF) == (True, "direct"))
+    check("group note rejected even from Ahmad",
+          should_process(in_group, "73439947845638", "Ahmad", SELF) == (False, "group"))
+    check("self-chat forward accepted",
+          should_process(selfchat, "73439947845638", "", SELF)[0] is True)
+    check("self-chat by lid accepted (device suffix tolerated)",
+          should_process(selflid, "73439947845638", "", SELF)[0] is True)
+    check("self-forward reason is reported",
+          should_process(selfchat, "", "", SELF)[1] == "forwarded-to-self")
+    check("unrelated sender rejected",
+          should_process(other, "73439947845638", "", SELF) == (False, "other-sender"))
+    check("group accepted when explicitly enabled",
+          should_process(in_group, "", "Ahmad", SELF, include_groups=True)[0] is True)
+    check("no self_jid configured: self-chat not special",
+          should_process(selfchat, "73439947845638", "", "")[0] is False)
+    # A message you send TO someone else is also fromMe, and must not qualify.
+    check("outgoing note to a third party is not a self-forward",
+          is_self_chat({"sender": "447958778593@s.whatsapp.net", "fromMe": True}, SELF) is False)
 
     now = int(datetime.now(timezone.utc).timestamp())
     old = int((datetime.now(timezone.utc) - timedelta(days=5)).timestamp())

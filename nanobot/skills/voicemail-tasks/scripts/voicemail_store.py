@@ -39,6 +39,13 @@ DEFAULT_SETTINGS = {
     # Spoken language of the voice notes. Telling Whisper up front is markedly
     # more accurate than letting it guess, especially on short or noisy clips.
     "transcribe_language": "ur",
+    # Voice notes sent to a group are ignored: they are rarely dictation aimed
+    # at you, and they would flood the task list.
+    "include_groups": "false",
+    # Your own address(es), comma separated. Anything in your "message
+    # yourself" chat is picked up, which is how you pull in a note that would
+    # otherwise be skipped - forward it to yourself.
+    "self_jid": "",
 }
 
 

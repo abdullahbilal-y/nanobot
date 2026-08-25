@@ -46,6 +46,24 @@ Display prefers `transcript_roman` and falls back to the raw transcript, so a
 romanisation failure degrades to Urdu script rather than hiding the message.
 Names, numbers and reference codes are preserved exactly in both fields.
 
+## What gets picked up
+
+| Where the voice note is | Processed? |
+|---|---|
+| Direct chat with the watched sender | yes |
+| Any group, including one they are in | no — `include_groups=false` |
+| Your own "message yourself" chat | yes, whoever originally sent it |
+
+Group notes are skipped because they are rarely dictation aimed at you and
+would swamp the list. Forwarding a note into your own chat is the deliberate
+override: it is always picked up, which is how you pull in something the
+filters would otherwise skip.
+
+`self_jid` takes a comma-separated list and should hold both your number and
+your LID, e.g. `923175081727,225537473675300@lid`. Matching is on the *chat
+address*, not on `fromMe` — a note you send to someone else is also `fromMe`
+and correctly does not qualify.
+
 ## Prerequisites
 
 1. **Bridge running and linked.** `cd bridge && npm run build && npm start`, then
